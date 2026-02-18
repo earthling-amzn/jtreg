@@ -117,14 +117,29 @@ public class XMLWriter {
     }
 
     private void startTestSuite() throws TestResult.Fault {
+        int testCount = countTestCases();
+        int failures = 0;
+        int errors = 0;
+        
+        // Count failures and errors across all test sections
+        if (!status.isPassed()) {
+            if (status.isError()) {
+                errors = 1;
+            } else {
+                failures = 1;
+            }
+        }
+        
         xps.print("<testsuite");
         xps.print(" errors=\"");
-        xps.print(status.isError() ? "1" : "0");
+        xps.print(String.valueOf(errors));
         xps.print("\"");
         xps.print(" failures=\"");
-        xps.print(status.isFailed() ? "1" : "0");
+        xps.print(String.valueOf(failures));
         xps.print("\"");
-        xps.print(" tests=\"1\"");
+        xps.print(" tests=\"");
+        xps.print(String.valueOf(testCount));
+        xps.print("\"");
         xps.print(" hostname=\"");
         xps.print(tr.getProperty("hostname"));
         xps.print("\"");
@@ -138,6 +153,17 @@ public class XMLWriter {
         xps.print(isoDateFmt.format(start));
         xps.print("\"");
         xps.println(">");
+    }
+    
+    private int countTestCases() throws TestResult.Fault {
+        String[] titles = tr.getSectionTitles();
+        int count = 0;
+        for (String title : titles) {
+            if (title.equals("main") || title.equals("shell")) {
+                count++;
+            }
+        }
+        return Math.max(1, count);
     }
 
     private void endTestSuite() {
@@ -189,70 +215,135 @@ public class XMLWriter {
         return "";
     }
 
-    private String getLastOutput(String name) throws TestResult.Fault {
+    private void insertTestCases() throws TestResult.Fault {
         String[] titles = tr.getSectionTitles();
-        String result = "";
-        // Find the last non-empty output from main/shell/compile sections
+        int testCaseNum = 0;
+        
         for (int i = 0; i < titles.length; i++) {
-            if (titles[i].equals("main") || titles[i].equals("shell") || titles[i].equals("compile")) {
-                Section s = tr.getSection(i);
-                String output = s.getOutput(name);
-                if (output != null && !output.isEmpty()) {
-                    result = output;
+            if (titles[i].equals("main") || titles[i].equals("shell")) {
+                Section section = tr.getSection(i);
+                testCaseNum++;
+                insertTestCaseForSection(section, titles[i], testCaseNum);
+            }
+        }
+    }
+    
+    private void insertTestCaseForSection(Section section, String sectionType, int num) throws TestResult.Fault {
+        String messages = section.getOutput("messages");
+        String command = extractCommand(messages);
+        double elapsedTime = extractElapsedTime(messages);
+        
+        xps.indent();
+        xps.print("<testcase ");
+        xps.print("classname=\"");
+        xps.print(classname);
+        xps.print("\"");
+        xps.print(" name=\"");
+        if (command != null && !command.isEmpty()) {
+            xps.print(command);
+        } else {
+            xps.print(tr.getDescription().getName());
+            if (num > 1) {
+                xps.print(" [" + sectionType + " #" + num + "]");
+            }
+        }
+        xps.print("\"");
+        xps.print(" time=\"");
+        xps.print(elapsedTime);
+        xps.print("\"");
+        xps.println(" >");
+        
+        // Insert failure if this section failed
+        insertFailureForSection(section);
+        
+        // Insert system-out and system-err for this section
+        insertSystemOutForSection(section);
+        insertSystemErrForSection(section);
+        
+        xps.indent();
+        xps.println("</testcase>");
+    }
+    
+    private String extractCommand(String messages) {
+        if (messages == null) return null;
+        String[] lines = messages.split("\n");
+        for (String line : lines) {
+            if (line.startsWith("command: ")) {
+                return line.substring("command: ".length()).trim();
+            }
+        }
+        return null;
+    }
+    
+    private double extractElapsedTime(String messages) {
+        if (messages == null) return 0.0;
+        String[] lines = messages.split("\n");
+        for (String line : lines) {
+            if (line.startsWith("elapsed time (seconds): ")) {
+                try {
+                    return Double.parseDouble(line.substring("elapsed time (seconds): ".length()).trim());
+                } catch (NumberFormatException e) {
+                    return 0.0;
                 }
             }
         }
-        return result;
+        return 0.0;
     }
-
-    private void insertSystemOut() throws TestResult.Fault {
-        xps.indent();
+    
+    private void insertSystemOutForSection(Section section) throws TestResult.Fault {
+        xps.indent(2);
         xps.print("<system-out>");
-        xps.sanitize(getOutput("System.out"));
-        xps.indent();
+        String stdout = section.getOutput("System.out");
+        if (stdout != null) {
+            xps.sanitize(stdout);
+        }
+        xps.indent(2);
         xps.println("</system-out>");
     }
-
-    private void insertSystemErr() throws TestResult.Fault {
-        xps.indent();
+    
+    private void insertSystemErrForSection(Section section) throws TestResult.Fault {
+        xps.indent(2);
         xps.print("<system-err>");
-        xps.sanitize(getOutput("System.err"));
-        xps.indent();
+        String stderr = section.getOutput("System.err");
+        if (stderr != null) {
+            xps.sanitize(stderr);
+        }
+        xps.indent(2);
         xps.println("</system-err>");
     }
-
-    private void insertFailure() {
-        if (status.isPassed())
+    
+    private void insertFailureForSection(Section section) throws TestResult.Fault {
+        Status sectionStatus = section.getStatus();
+        if (sectionStatus == null || sectionStatus.isPassed()) {
             return;
-        xps.indent();
+        }
+        
+        xps.indent(2);
         xps.print("<failure type=\"");
         xps.print(XMLWriter.FAILED);
         xps.println("\">");
-        xps.sanitize(status.getReason());
-
-        try {
-            String crashInfo = extractCrashInfo();
-            if (crashInfo != null && !crashInfo.isEmpty()) {
-                xps.println("\n\n--- JVM Crash Details ---");
-                xps.sanitize(crashInfo);
-            }
-        } catch (TestResult.Fault e) {
-            // Ignore if we can't get crash info
+        xps.sanitize(sectionStatus.getReason());
+        
+        // Extract crash info from this section's output
+        String crashInfo = extractCrashInfoFromSection(section);
+        if (crashInfo != null && !crashInfo.isEmpty()) {
+            xps.println("\n\n--- JVM Crash Details ---");
+            xps.sanitize(crashInfo);
         }
-
-        xps.indent();
+        
+        xps.indent(2);
         xps.println("");
         xps.println("</failure>");
     }
-
-    private String extractCrashInfo() throws TestResult.Fault {
-        String stderr = getLastOutput("System.err");
+    
+    private String extractCrashInfoFromSection(Section section) throws TestResult.Fault {
+        String stderr = section.getOutput("System.err");
         String crashFromErr = extractCrashFromOutput(stderr);
         if (crashFromErr != null) {
             return crashFromErr;
         }
-
-        String stdout = getLastOutput("System.out");
+        
+        String stdout = section.getOutput("System.out");
         return extractCrashFromOutput(stdout);
     }
 
@@ -268,8 +359,8 @@ public class XMLWriter {
 
         for (String line : lines) {
             if (line.startsWith("#") && (line.contains("SIGSEGV") || line.contains("SIGBUS") ||
-                line.contains("SIGABRT") || line.contains("problematic frame") ||
-                line.contains("Internal Error") || line.contains("fatal error"))) {
+                    line.contains("SIGABRT") || line.contains("problematic frame") ||
+                    line.contains("Internal Error") || line.contains("fatal error"))) {
                 inCrash = true;
             }
 
@@ -282,34 +373,14 @@ public class XMLWriter {
             }
         }
 
-        return crash.length() > 0 ? crash.toString() : null;
-    }
-
-    private void insertTestCase() throws TestResult.Fault {
-        xps.indent();
-        xps.print("<testcase ");
-        xps.print("classname=\"");
-        xps.print(classname);
-        xps.print("\"");
-        xps.print(" name=\"");
-        xps.print(tr.getDescription().getName());
-        xps.print("\"");
-        xps.print(" time=\"");
-        xps.print(duration);
-        xps.print("\"");
-        xps.println(" >");
-        insertFailure();
-        xps.indent();
-        xps.println("</testcase>");
+        return crash.length() == 0 ? null : crash.toString();
     }
 
     private void process(String encoding) throws TestResult.Fault {
         createHeader(encoding);
         startTestSuite();
         insertProperties();
-        insertTestCase();
-        insertSystemOut();
-        insertSystemErr();
+        insertTestCases();
         endTestSuite();
     }
 
